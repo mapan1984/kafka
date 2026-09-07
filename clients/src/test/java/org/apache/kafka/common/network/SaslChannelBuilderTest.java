@@ -27,10 +27,13 @@ import org.apache.kafka.common.security.JaasContext;
 import org.apache.kafka.common.security.TestSecurityConfig;
 import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.auth.SecurityProtocol;
+import org.apache.kafka.common.security.authenticator.CredentialCache;
 import org.apache.kafka.common.security.authenticator.TestJaasConfig;
 import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
 import org.apache.kafka.common.security.plain.PlainLoginModule;
+import org.apache.kafka.common.security.scram.ScramCredential;
 import org.apache.kafka.common.security.scram.ScramLoginModule;
+import org.apache.kafka.common.utils.LogCaptureAppender;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.test.TestUtils;
@@ -47,6 +50,7 @@ import org.mockito.Mockito;
 import java.lang.reflect.Field;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
 
@@ -162,6 +166,57 @@ public class SaslChannelBuilderTest {
 
         SaslChannelBuilder saslSslBuilder = createChannelBuilder(SecurityProtocol.SASL_SSL, "PLAIN");
         saslSslBuilder.configure(configs);
+    }
+
+    @Test
+    public void testWarnOnMissingLoginModule() {
+        // SCRAM-SHA-256 configured with PlainLoginModule only, so ScramSaslServerProvider is never registered
+        List<String> warnings = configureScramAndCaptureWarnings(PlainLoginModule.class.getName());
+        assertTrue(warnings.stream().anyMatch(m ->
+                m.contains("SCRAM-SHA-256") && m.contains("PlainLoginModule") && m.contains("ScramLoginModule")),
+            "Expected WARN log about the missing LoginModule for SCRAM-SHA-256, got: " + warnings);
+    }
+
+    @Test
+    public void testNoWarnOnCorrectLoginModule() {
+        List<String> warnings = configureScramAndCaptureWarnings(ScramLoginModule.class.getName());
+        assertTrue(warnings.stream().noneMatch(m -> m.contains("LoginModule")),
+            "No LoginModule WARN expected when the mechanism's LoginModule is configured, got: " + warnings);
+    }
+
+    @Test
+    public void testNoWarnWhenJaasContextDeclaresAdditionalLoginModules() {
+        // A static JAAS file shares a single `KafkaServer` entry across all mechanisms, so the context of
+        // SCRAM-SHA-256 also lists the PLAIN login module. That is a valid setup and must not warn.
+        List<String> warnings = configureScramAndCaptureWarnings(
+            ScramLoginModule.class.getName(), PlainLoginModule.class.getName());
+        assertTrue(warnings.stream().noneMatch(m -> m.contains("LoginModule")),
+            "No LoginModule WARN expected when the required LoginModule is one of several, got: " + warnings);
+    }
+
+    /**
+     * Configures a SCRAM-SHA-256 server channel builder whose JAAS context declares the given login modules,
+     * and returns the WARN messages logged by {@link SaslChannelBuilder} while configuring.
+     */
+    private List<String> configureScramAndCaptureWarnings(String... loginModules) {
+        TestJaasConfig jaasConfig = new TestJaasConfig();
+        for (String loginModule : loginModules)
+            jaasConfig.addEntry("jaasContext", loginModule, new HashMap<>());
+        JaasContext jaasContext = new JaasContext("jaasContext", JaasContext.Type.SERVER, jaasConfig, null);
+        Map<String, JaasContext> jaasContexts = Collections.singletonMap("SCRAM-SHA-256", jaasContext);
+        CredentialCache credentialCache = new CredentialCache();
+        credentialCache.createCache("SCRAM-SHA-256", ScramCredential.class);
+
+        SaslChannelBuilder channelBuilder = new SaslChannelBuilder(ConnectionMode.SERVER, jaasContexts,
+            SecurityProtocol.SASL_PLAINTEXT, new ListenerName("SASL_PLAINTEXT"), false, "SCRAM-SHA-256",
+            true, credentialCache, null, null, Time.SYSTEM, new LogContext(), defaultApiVersionsSupplier());
+
+        try (LogCaptureAppender appender = LogCaptureAppender.createAndRegister(SaslChannelBuilder.class)) {
+            channelBuilder.configure(new HashMap<>());
+            return appender.getMessages("WARN");
+        } finally {
+            channelBuilder.close();
+        }
     }
 
     private SaslChannelBuilder createGssapiChannelBuilder(Map<String, JaasContext> jaasContexts, GSSManager gssManager) {

@@ -42,9 +42,11 @@ import org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule;
 import org.apache.kafka.common.security.oauthbearer.internals.OAuthBearerRefreshingLogin;
 import org.apache.kafka.common.security.oauthbearer.internals.OAuthBearerSaslClientCallbackHandler;
 import org.apache.kafka.common.security.oauthbearer.internals.unsecured.OAuthBearerUnsecuredValidatorCallbackHandler;
+import org.apache.kafka.common.security.plain.PlainLoginModule;
 import org.apache.kafka.common.security.plain.internals.PlainSaslServer;
 import org.apache.kafka.common.security.plain.internals.PlainServerCallbackHandler;
 import org.apache.kafka.common.security.scram.ScramCredential;
+import org.apache.kafka.common.security.scram.ScramLoginModule;
 import org.apache.kafka.common.security.scram.internals.ScramMechanism;
 import org.apache.kafka.common.security.scram.internals.ScramServerCallbackHandler;
 import org.apache.kafka.common.security.ssl.SslFactory;
@@ -65,6 +67,7 @@ import java.io.IOException;
 import java.net.Socket;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -75,6 +78,7 @@ import java.util.function.Supplier;
 
 import javax.security.auth.Subject;
 import javax.security.auth.kerberos.KerberosPrincipal;
+import javax.security.auth.login.AppConfigurationEntry;
 
 public class SaslChannelBuilder implements ChannelBuilder, ListenerReconfigurable {
     static final String GSS_NATIVE_PROP = "sun.security.jgss.native";
@@ -147,6 +151,7 @@ public class SaslChannelBuilder implements ChannelBuilder, ListenerReconfigurabl
             if (connectionMode == ConnectionMode.SERVER) {
                 createServerCallbackHandlers(configs);
                 createConnectionsMaxReauthMsMap(configs);
+                warnIfLoginModuleMismatch();
             } else
                 createClientCallbackHandler(configs);
             for (Map.Entry<String, AuthenticateCallbackHandler> entry : saslCallbackHandlers.entrySet()) {
@@ -347,6 +352,45 @@ public class SaslChannelBuilder implements ChannelBuilder, ListenerReconfigurabl
             if (connectionsMaxReauthMs != null)
                 connectionsMaxReauthMsByMechanism.put(mechanism, connectionsMaxReauthMs);
         }
+    }
+
+    /**
+     * Warn if the JAAS configuration of a mechanism does not include the LoginModule expected
+     * for that mechanism. The LoginModule is what registers the mechanism's SaslServerProvider
+     * in its static initializer, so without it Sasl.createSaslServer() returns null at
+     * authentication time.
+     */
+    private void warnIfLoginModuleMismatch() {
+        for (Map.Entry<String, JaasContext> entry : jaasContexts.entrySet()) {
+            String mechanism = entry.getKey();
+            String expectedLoginModule = expectedLoginModuleForMechanism(mechanism);
+            if (expectedLoginModule == null)
+                continue;  // unknown mechanism (e.g. custom), skip check
+            // A context loaded from a static JAAS file exposes every login module of the
+            // `KafkaServer` section and is shared by all mechanisms, so extra modules are
+            // expected. Only the absence of the required one is worth warning about.
+            List<String> loginModules = new ArrayList<>();
+            for (AppConfigurationEntry configEntry : entry.getValue().configurationEntries())
+                loginModules.add(configEntry.getLoginModuleName().trim());
+            if (!loginModules.contains(expectedLoginModule)) {
+                log.warn("SASL mechanism '{}' is configured with LoginModule(s) {}, but '{}' is missing. "
+                    + "This may cause authentication failures because the required SaslServer provider "
+                    + "is registered by that LoginModule. "
+                    + "Check your JAAS configuration for listener '{}'.",
+                    mechanism, loginModules, expectedLoginModule, listenerName);
+            }
+        }
+    }
+
+    private static String expectedLoginModuleForMechanism(String mechanism) {
+        if (PlainSaslServer.PLAIN_MECHANISM.equals(mechanism))
+            return PlainLoginModule.class.getName();
+        if (ScramMechanism.isScram(mechanism))
+            return ScramLoginModule.class.getName();
+        if (OAuthBearerLoginModule.OAUTHBEARER_MECHANISM.equals(mechanism))
+            return OAuthBearerLoginModule.class.getName();
+        // GSSAPI uses JDK built-in or third-party Kerberos LoginModules, too many variants to validate
+        return null;
     }
 
     protected Class<? extends Login> defaultLoginClass() {
