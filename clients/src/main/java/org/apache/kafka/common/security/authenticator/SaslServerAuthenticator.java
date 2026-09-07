@@ -203,6 +203,9 @@ public class SaslServerAuthenticator implements Authenticator {
         final AuthenticateCallbackHandler callbackHandler = callbackHandlers.get(mechanism);
         if (mechanism.equals(SaslConfigs.GSSAPI_MECHANISM)) {
             saslServer = createSaslKerberosServer(callbackHandler, configs, subject);
+            if (saslServer == null) {
+                throw new SaslException("Kafka Server failed to create a SaslServer to interact with a client during session authentication with server mechanism " + saslMechanism);
+            }
         } else {
             try {
                 saslServer = SecurityManagerCompatibility.get().callAs(subject, () ->
@@ -556,7 +559,14 @@ public class SaslServerAuthenticator implements Authenticator {
         }
         if (clientMechanism != null && (!reauthInfo.reauthenticating()
                 || reauthInfo.saslMechanismUnchanged(clientMechanism))) {
-            createSaslServer(clientMechanism);
+            try {
+                createSaslServer(clientMechanism);
+            } catch (SaslException e) {
+                LOG.error("Failed to create SaslServer for mechanism {} with client {}",
+                        clientMechanism, clientAddress(), e);
+                throw new SaslAuthenticationException(
+                        "Failed to create SaslServer for mechanism " + clientMechanism, e);
+            }
             setSaslState(SaslState.AUTHENTICATE);
         }
         return isKafkaRequest;
